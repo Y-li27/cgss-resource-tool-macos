@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>CGSS カードSpineアニメーションプレビュー（Spine 3.6 / JSON）</title>
+<style>
+  body { font-family: "Noto Sans JP", sans-serif; background:#222; color:#eee; padding:16px; }
+  h1 { font-size:18px; }
+  .row { margin:8px 0; }
+  label { display:inline-block; width:130px; }
+  canvas { background:#333; border:1px solid #555; display:block; margin-top:12px; max-width:100%; }
+  select, button { padding:4px 8px; }
+  #msg { color:#f80; white-space:pre-wrap; }
+  #fps { color:#8f8; }
+</style>
+</head>
+<h1>CGSS カードSpineアニメーションプレビュー（データバージョン 3.6）</h1>
+<p>使い方：<br>
+<b>カードSpineアニメーション</b>（キャラクターディレクトリ\カードSpineアニメーション\spine以下）：<br>
+  骨格ファイルは5つすべて選択してください。<br>
+（SP3S{カードID}_bg / _chara / _eff1 / _eff2 / _fgの .skelまたは .skel.asset）。<br>
+  ページ側で自動的にJSONへ変換します。<br>
+  AtlasはSP3S{カードID}_tex.atlas（.asset）を選択し、<br>
+  テクスチャはtex.png + tex_A8.pngを選択してください<br>
+（A8は透明チャンネルで、自動的に合成して黒い縁を除去します）。<br>
+
+<b>Spineキャラクター</b>（キャラクターディレクトリ\spine以下）：<br>
+  骨格ファイルはSPSprachen_s.json / SPSprachen_N.jsonを選択してください。<br>
+（<b>旧カードはN、新しいカードはs</b>。<br>
+  判断できない場合は両方試し、頭身が正常な方が正しいデータです）。<br>
+  atlasはSPC{カードID}.atlas（.asset）を選択し、<br>
+  テクスチャはSPC{カードID}.pngを選択してください。<br>
+（アルファチャンネル内蔵のため、A8は不要です）。<br>
+  左右反転している場合は、下の「左右反転（flip）」チェックボックスで切り替えてください。<br>
+
+レイヤーの順序は自動的に設定されます：bg → eff2 → chara → eff1 → fg。</p>
+
+<div class="row">
+  <label>骨格 .skel/.asset/.json：</label>
+  <input type="file" id="f_skel" accept=".skel,.skel.asset,.json,.asset" multiple>
+</div>
+
+<div class="row">
+  <label>Atlas .atlas：</label>
+  <input type="file" id="f_atlas" accept=".atlas,.atlas.asset,.asset">
+</div>
+
+<div class="row">
+  <label>テクスチャ .png：</label>
+  <input type="file" id="f_png" accept=".png" multiple>
+</div>
+
+<div class="row" id="anim_rows"></div>
+
+<div class="row">
+  <button id="btn_play">再生</button>
+  <button id="btn_pause">一時停止</button>
+  <label>再生速度</label>
+  <input type="range" id="speed" min="0.1" max="3" step="0.1" value="1">
+
+  <label>すべてのレイヤーを表示</label>
+  <input type="checkbox" id="chk_all" checked>
+
+  <label>左右反転（flip）</label>
+  <input type="checkbox" id="chk_flip" checked>
+
+  <button id="btn_export" title="背景（bg）の範囲に合わせてMP4を書き出します（最高ビットレート）">
+    MP4を書き出す（beta）
+  </button>
+
+  <span id="export_status"></span>
+  <span id="fps"></span>
+</div>
+<div id="msg"></div>
+<canvas id="cv"></canvas>
+
+<script src="spine-core.js"></script>
+<script src="spine-canvas.js"></script>
+<script src="spine-webgl.js"></script>
+<script src="cgss_skel_parser.js"></script>
+<script src="mp4-muxer.min.js"></script>
+<script>
+var skelList = [];       // [{name, skeleton, state, data, sel, check}]
+var atlasText = null;
+var pngMap = {};         // ベース名 -> Image
+var compositeMap = {};   // ベース名 -> 合成済みRGBAキャンバス
+var renderer = null, last = 0, playing = true;
+var fit = { scale: 1, tx: 0, ty: 0 };
+var SS = 2;              // スーパーサンプリング倍率：フレーム全体を2倍のオフスクリーンキャンバスに描画してから縮小し、三角形の継ぎ目を軽減
+try { var _m = /[?&]ss=(\d+)/.exec(location.search); if (_m) SS = parseInt(_m[1], 10) || 2; } catch(e){}
+var offCanvas = null, offRenderer = null;
+var glCanvas = null, glRenderer = null;
+var expGL = null, expGLCanvas = null;
+
+function msg(s){ document.getElementById('msg').textContent = s; }
+
+// Spineキャラクター（SPSprachen）の骨格にflipを適用して左右反転を制御。
+// チェックあり = scaleX -1（デフォルト）、チェックなし = データ本来のscaleX 1。
+function applyPetitFlip(s){
+  if (s.flipBone === undefined) s.flipBone = s.skeleton.findBone('flip') || null;
+  if (s.flipBone) s.flipBone.scaleX = document.getElementById('chk_flip').checked ? -1 : 1;
+}
+
+document.getElementById('f_skel').addEventListener('change', function(e){
+  skelList = [];
+  var files = Array.prototype.slice.call(e.target.files);
+  var pending = files.length;
+  files.forEach(function(f){
+    f.arrayBuffer().then(function(ab){
+      var head = new Uint8Array(ab, 0, 4);
+      var first = String.fromCharCode(head[0]);
+      var looksJson = first === '{' || first === ' ' || first === '\t' || first === '\r' || first === '\n' || first === 'S' || first === 's';
+      if (!looksJson) {
+// CGSSバイナリskel（0x1Cヘッダー）または.skel.asset：バイナリとして解析
+        var obj = CGSSSkelParser.parse(ab);
+        skelList.push({ name: f.name, text: JSON.stringify(obj) });
+        if (--pending === 0) { finishSkelLoad(files.length); }
+      } else {
+        var text = new TextDecoder('utf-8').decode(ab);
+        try {
+          var obj = JSON.parse(text);
+          if (!obj || !obj.bones) throw new Error('not skeleton json');
+        } catch (e1) {
+          msg('ファイル「' + f.name + '」は骨格ファイルではありません（JSONの解析に失敗しました）。\n' +
+'Spineキャラクターの場合は、骨格に SPSprachen_s.json、Atlasに SPC{id}.atlas（.asset）、\n' +
+'テクスチャに SPC{id}.png を選択してください。');
+          if (--pending === 0) { finishSkelLoad(files.length); }
+          return;
+        }
+        skelList.push({ name: f.name, text: text });
+        if (--pending === 0) { finishSkelLoad(files.length); }
+      }
+    }).catch(function(err){ msg('読取 ' + f.name + ' 失敗：' + err.message); });
+  });
+});
+function finishSkelLoad(n){
+    //図層の優先順位でソート：bg → eff2 → chara → eff1 → fg（その他は最後に、名前順）
+  function priority(name){
+    var s = name.toLowerCase();
+    if (s.indexOf('bg') >= 0) return 0;
+    if (s.indexOf('eff2') >= 0) return 1;
+    if (s.indexOf('chara') >= 0) return 2;
+    if (s.indexOf('eff1') >= 0) return 3;
+    if (s.indexOf('fg') >= 0) return 4;
+    return 5;
+  }
+  skelList.sort(function(a, b){
+    var pa = priority(a.name), pb = priority(b.name);
+    return pa !== pb ? pa - pb : (a.name < b.name ? -1 : 1);
+  });
+  var hint = '';
+  try {
+    var sk = skelList.length ? JSON.parse(skelList[0].text) : null;
+    if (sk && sk.bones){
+      var shadow = null;
+      for (var i = 0; i < sk.bones.length; i++)
+        if (sk.bones[i].name === 'shadow'){ shadow = sk.bones[i]; break; }
+      var isN = shadow && typeof shadow.scaleX === 'number' && Math.abs(shadow.scaleX) < 1;
+      hint = isN ? '（N 本のボーンを検出：古いカード用）' : 's 本のボーンを検出：新しいカード用';
+    }
+  } catch(e){}
+  msg('選択済みのボーン' + n + '個（レイヤー順にソート済み）' + hint);
+  tryInit();
+}
+document.getElementById('f_atlas').addEventListener('change', function(e){
+  var f = e.target.files[0];
+  if (!f) return;
+  f.text().then(function(t){ atlasText = t; msg('選択済みatlas：' + f.name); tryInit(); });
+});
+document.getElementById('f_png').addEventListener('change', function(e){
+  pngMap = {};
+  compositeMap = {};
+  var files = Array.prototype.slice.call(e.target.files);
+  var pending = files.length;
+  files.forEach(function(f){
+    var img = new Image();
+    img.onload = function(){ pngMap[f.name] = img; if (--pending === 0) { buildComposite(); msg('選択済みテクスチャ' + files.length + ' 個'); tryInit(); } };
+    img.src = URL.createObjectURL(f);
+  });
+});
+
+// CGSS は RGB のメインテクスチャ + 独立した A8 透過チャンネルの構成で、この 2 枚を合成して本来の RGBA にし、黒い下地や黒フチを取り除きます
+function buildComposite(){
+  Object.keys(pngMap).forEach(function(k){
+    var m = /^(.*)_A8\.png$/i.exec(k);
+    if (!m) return;
+    var rgbName = m[1] + '.png';
+    if (!pngMap[rgbName]) return;
+    var rgb = pngMap[rgbName], a8 = pngMap[k];
+    var c = document.createElement('canvas');
+    c.width = rgb.naturalWidth;
+    c.height = rgb.naturalHeight;
+    var cx = c.getContext('2d');
+    cx.drawImage(rgb, 0, 0, c.width, c.height);
+    cx.globalCompositeOperation = 'destination-in';  // A8 のアルファで RGB を保持
+    cx.drawImage(a8, 0, 0, c.width, c.height);
+    compositeMap[rgbName] = c;
+    msg('合成済みアルファ：' + rgbName + ' + ' + k);
+  });
+}
+
+function tryInit(){
+  if (!skelList.length || !atlasText || !Object.keys(pngMap).length) return;
+  try {
+    var canvas = document.getElementById('cv');
+    var ctx = canvas.getContext('2d');
+    renderer = new spine.canvas.SkeletonRenderer(ctx);
+    renderer.triangleRendering = true; // mesh は三角形レンダリングを有効にする必要があります
+    var loader = function(path){
+      var key = path.split(/[\\\/]/).pop();
+      if (compositeMap[key]) return new spine.canvas.CanvasTexture(compositeMap[key]);
+      var img = pngMap[key];
+      if (!img) {
+      //atlasが参照しているテクスチャが未選択の場合：黙って最初のテクスチャを使って「ランダムな切り抜き」にせず、明示的にエラーを出す
+        throw new Error('atlasが参照しているテクスチャ "' + key + '"選択済みテクスチャに含まれておらず、atlasとテクスチャが対応していません。\n' +
+          'キャラを選択してください：ボーン SPSprachen_s.json + atlas SPC{角色/卡id}.atlas(.asset) + テクスチャ SPC{キャラクター／カード id}.png\n' +
+          'カード表面アニメ用に選択してください：5 個の SP3S{カードID}_*.skel + SP3S{カードID}_tex.atlas（.asset）+ tex.png + tex_A8.png');
+      }
+      return new spine.canvas.CanvasTexture(img);
+    };
+    var atlas = new spine.TextureAtlas(atlasText, loader);
+    var att = new spine.AtlasAttachmentLoader(atlas);
+    var j = new spine.SkeletonJson(att);
+
+    canvas.width = 1400;
+    canvas.height = 1400;
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    offCanvas = document.createElement('canvas');
+    offCanvas.width = canvas.width * SS;
+    offCanvas.height = canvas.height * SS;
+    offRenderer = new spine.canvas.SkeletonRenderer(offCanvas.getContext('2d'));
+    offRenderer.triangleRendering = true;
+    //優先的に WebGL を使用します（三角形の継ぎ目なし）。失敗した場合は canvas 2D + スーパーサンプリングにフォールバックします。
+    glCanvas = null; glRenderer = null;
+    try {
+      glCanvas = document.createElement('canvas');
+      glCanvas.width = canvas.width;
+      glCanvas.height = canvas.height;
+      glRenderer = new CGSSWebGLRenderer(glCanvas, { preserveDrawingBuffer: true });
+    } catch (e2) { glRenderer = null; glCanvas = null; }
+
+    skelList.forEach(function(s){
+      var data = j.readSkeletonData(s.text);
+      s.skeleton = new spine.Skeleton(data);
+      s.skeleton.flipY = true;   // Spine の座標系では y 軸は上向き、canvas では y 軸は下向きであり、公式サンプルでもこの方法で補正しています。
+      s.state = new spine.AnimationState(new spine.AnimationStateData(data));
+      s.data = data;
+    });
+
+    var rows = document.getElementById('anim_rows');
+    rows.innerHTML = '';
+    skelList.forEach(function(s){
+      var lab = document.createElement('label');
+      lab.textContent = s.name + '：';
+      var sel = document.createElement('select');
+      s.data.animations.forEach(function(a){
+        var o = document.createElement('option');
+        o.textContent = a.name; o.value = a.name; sel.appendChild(o);
+      });
+      s.sel = sel;
+      sel.addEventListener('change', function(){
+        if (s.state && sel.value) s.state.setAnimation(0, sel.value, true);
+      });
+      var chk = document.createElement('input');
+      chk.type = 'checkbox'; chk.checked = true;
+      s.check = chk;
+      rows.appendChild(lab); rows.appendChild(sel); rows.appendChild(chk);
+      rows.appendChild(document.createElement('br'));
+      if (s.data.animations.length) s.state.setAnimation(0, s.data.animations[0].name, true);
+    });
+
+    //背景あり（カードアニメ）: 各レイヤーの静的 setup バウンディングボックスでフィットさせ、背景は画面いっぱいに敷き詰める（エフェクトの範囲が広いので、エフェクト基準ではスケーリングしない）。
+    //背景なし（キャラ単体）: アニメ全体のバウンディングボックスでフィットさせて、歩いても画面外にはみ出さないようにする。
+    var hasBg = false;
+    skelList.forEach(function(s){ if (/bg/i.test(s.name)) hasBg = true; });
+    var offset = new spine.Vector2(), size = new spine.Vector2(), temp = [];
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    skelList.forEach(function(s){
+      var anim = s.data.animations.length ? s.data.animations[0] : null;
+      if (hasBg){
+        s.skeleton.setToSetupPose();
+        s.skeleton.updateWorldTransform();
+        s.skeleton.getBounds(offset, size, temp);
+        if (isFinite(offset.x) && size.x > 0) {
+          minX = Math.min(minX, offset.x); minY = Math.min(minY, offset.y);
+          maxX = Math.max(maxX, offset.x + size.x); maxY = Math.max(maxY, offset.y + size.y);
+        }
+      } else {
+        var dur = anim ? anim.duration : 1;
+        var steps = Math.max(2, Math.round(dur * 30));
+        for (var k = 0; k <= steps; k++){
+          var t = dur * k / steps;
+          if (anim){ s.state.setAnimation(0, anim.name, false); s.state.update(t); }
+          s.state.apply(s.skeleton);
+          s.skeleton.updateWorldTransform();
+          s.skeleton.getBounds(offset, size, temp);
+          if (isFinite(offset.x) && size.x > 0) {
+            minX = Math.min(minX, offset.x); minY = Math.min(minY, offset.y);
+            maxX = Math.max(maxX, offset.x + size.x); maxY = Math.max(maxY, offset.y + size.y);
+          }
+        }
+        if (anim) s.state.setAnimation(0, anim.name, true);
+      }
+    });
+    if (isFinite(minX) && maxX > minX) {
+      var bw = maxX - minX, bh = maxY - minY;
+      fit.scale = Math.min(canvas.width / bw, canvas.height / bh) * 0.92;
+      fit.tx = (canvas.width - (maxX + minX) * fit.scale) / 2;
+      fit.ty = (canvas.height - (maxY + minY) * fit.scale) / 2;
+    } else {
+      fit.scale = 1; fit.tx = canvas.width / 2; fit.ty = canvas.height / 2;
+    }
+    msg('読み込み成功：' + skelList.length + ' 個のボーン（画面に自動フィット）');
+    last = performance.now();
+    requestAnimationFrame(loop);
+  } catch (err) {
+    msg('読み込み失敗：' + err.message + '\n' + (err.stack || ''));
+  }
+}
+
+function loop(t){
+  requestAnimationFrame(loop);
+  if (!skelList.length || !playing) return;
+  var dt = Math.min(0.05, (t - last) / 1000);
+  last = t;
+  var sp = parseFloat(document.getElementById('speed').value) || 1;
+  var canvas = document.getElementById('cv');
+  var ctx = canvas.getContext('2d');
+  if (glRenderer) {
+    glRenderer.setTransform(fit.scale, fit.tx, fit.ty);
+    glRenderer.clear(0.2, 0.2, 0.2, 1);
+    skelList.forEach(function(s){
+      if (s.check && !s.check.checked) return;
+      s.state.update(dt * sp);
+      s.state.apply(s.skeleton);
+      applyPetitFlip(s);
+      s.skeleton.updateWorldTransform();
+      glRenderer.draw(s.skeleton);
+    });
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.drawImage(glCanvas, 0, 0, glCanvas.width, glCanvas.height, 0, 0, canvas.width, canvas.height);
+    document.getElementById('fps').textContent = ' ' + Math.round(1000 / Math.max(1, dt * 1000 / sp)) + ' fps (WebGL)';
+    return;
+  }
+  var octx = offCanvas ? offCanvas.getContext('2d') : null;
+  var renderCtx = octx || ctx;
+  var r = octx ? offRenderer : renderer;
+  renderCtx.setTransform(1,0,0,1,0,0);
+  renderCtx.clearRect(0,0,offCanvas ? offCanvas.width : canvas.width, offCanvas ? offCanvas.height : canvas.height);
+  renderCtx.setTransform(fit.scale * (octx ? SS : 1),0,0,fit.scale * (octx ? SS : 1),fit.tx * (octx ? SS : 1),fit.ty * (octx ? SS : 1));
+  skelList.forEach(function(s){
+    if (s.check && !s.check.checked) return;
+    s.state.update(dt * sp);
+    s.state.apply(s.skeleton);
+    applyPetitFlip(s);
+    s.skeleton.updateWorldTransform();
+    r.draw(s.skeleton);
+  });
+  if (octx) {
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(offCanvas, 0, 0, offCanvas.width, offCanvas.height, 0, 0, canvas.width, canvas.height);
+  }
+  document.getElementById('fps').textContent = ' ' + Math.round(1000 / Math.max(1, dt * 1000 / sp)) + ' fps';
+}
+
+document.getElementById('btn_play').onclick = function(){ playing = true; };
+document.getElementById('btn_pause').onclick = function(){ playing = false; };
+document.getElementById('chk_all').addEventListener('change', function(e){
+  skelList.forEach(function(s){ if (s.check) s.check.checked = e.target.checked; });
+});
+
+/* ================= MP4 書き出し（WebCodecs H.264 + mp4-muxer） =================
+- キャンバス範囲は bg（背景）ボーンを基準とする。bg がない場合は全レイヤーのバウンディングボックスを使用。
+- 最高仕様：30fps（データ本来のフレームレート）+ 高ビットレート H.264。サイズは背景の実サイズ（偶数かつ上限 4096）とする。
+*/
+function findAnim(s){
+  var name = s.sel && s.sel.value ? s.sel.value : (s.data.animations[0] ? s.data.animations[0].name : null);
+  if (!name) return null;
+  for (var i = 0; i < s.data.animations.length; i++)
+    if (s.data.animations[i].name === name) return s.data.animations[i];
+  return null;
+}
+
+function exportBounds(){
+  var fps = 30, dur = 0;
+  skelList.forEach(function(s){
+    var a = findAnim(s);
+    if (a && a.duration > dur) dur = a.duration;
+  });
+  if (!(dur > 0)) dur = 8;
+  var bg = null;
+  skelList.forEach(function(s){ if (/bg/i.test(s.name)) bg = s; });
+  var targets = bg ? [bg] : skelList;
+  // 画面範囲 = 背景の静的サイズ（setup pose のバウンディングボックス）。背景がない（キャラ単体）の場合はキャラ自身のサイズを使用する
+  var offset = new spine.Vector2(), size = new spine.Vector2(), temp = [];
+  var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  targets.forEach(function(s){
+    s.skeleton.setToSetupPose();
+    s.skeleton.updateWorldTransform();
+    s.skeleton.getBounds(offset, size, temp);
+    if (isFinite(offset.x) && size.x > 0){
+      minX = Math.min(minX, offset.x); minY = Math.min(minY, offset.y);
+      maxX = Math.max(maxX, offset.x + size.x); maxY = Math.max(maxY, offset.y + size.y);
+    }
+  });
+  if (!isFinite(minX) || !(maxX > minX)){ minX = -600; minY = -600; maxX = 600; maxY = 600; }
+  return { minX: minX, minY: minY, maxX: maxX, maxY: maxY, duration: dur, fps: fps };
+}
+
+function exportMp4Name(){
+  for (var i = 0; i < skelList.length; i++){
+    if (/bg/i.test(skelList[i].name)){
+      var m = /SP3S(\d+)/.exec(skelList[i].name);
+      if (m) return 'SP3S' + m[1];
+    }
+  }
+  var m2 = /(SPC\d+|SP3S\d+)/.exec(skelList.length ? skelList[0].name : '');
+  return m2 ? m2[1] : 'export';
+}
+
+function exportMP4(){
+  if (!skelList.length){ msg('先にボーンを読み込んでください'); return; }
+  if (!window.VideoEncoder || !window.VideoFrame){ msg('現在のブラウザは WebCodecs に対応していないため、MP4 を書き出せません（最新版の Chrome／Edge を使用してください）'); return; }
+  if (typeof Mp4Muxer === 'undefined'){ msg('mp4-muxer.min.js がありません'); return; }
+  var b = exportBounds();
+  //H.264（yuv420）では幅と高さを偶数にする必要があるため、まず背景サイズに四捨五入し、そのうえで上方向に切り上げて偶数にする（できるだけ背景の実サイズに近づける）
+  var w = Math.round(b.maxX - b.minX), h = Math.round(b.maxY - b.minY);
+  var maxDim = 4096;
+  var sc = Math.min(1, maxDim / Math.max(w, h));
+  w = Math.max(2, Math.floor(w * sc)); h = Math.max(2, Math.floor(h * sc));
+  if (w % 2) w++; if (h % 2) h++;
+  var btn = document.getElementById('btn_export');
+  var st = document.getElementById('export_status');
+  btn.disabled = true;
+  st.textContent = '準備中（' + w + 'x' + h + '，' + b.duration.toFixed(1) + 's @ ' + b.fps + 'fps）...';
+
+  var canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  var ctx = canvas.getContext('2d');
+  // 優先的に WebGL で書き出し（継ぎ目なし）。失敗した場合は canvas 2D のスーパーサンプリングにフォールバックします
+  expGL = null; expGLCanvas = null;
+  try {
+    expGLCanvas = document.createElement('canvas');
+    expGLCanvas.width = w; expGLCanvas.height = h;
+    expGL = new CGSSWebGLRenderer(expGLCanvas, { preserveDrawingBuffer: true });
+  } catch (e3) { expGL = null; expGLCanvas = null; }
+  var EF = Math.min(2, maxDim / Math.max(w, h));   // 書き出しもスーパーサンプリングを行う（オフスクリーンは 4096 を超えない）
+  var expOff = document.createElement('canvas');
+  expOff.width = Math.max(2, Math.round(w * EF));
+  expOff.height = Math.max(2, Math.round(h * EF));
+  var ectx = expOff.getContext('2d');
+  var expRenderer = new spine.canvas.SkeletonRenderer(ectx);
+  expRenderer.triangleRendering = true;
+
+  var muxer = new Mp4Muxer.Muxer({
+    target: new Mp4Muxer.ArrayBufferTarget(),
+    video: { codec: 'avc', width: w, height: h, frameRate: b.fps },
+    fastStart: 'in-memory'
+  });
+  var bitrate = Math.min(100000000, Math.round(w * h * b.fps * 0.7));
+  var encoder = new VideoEncoder({
+    output: function(chunk, meta){ muxer.addVideoChunk(chunk, meta); },
+    error: function(e){ console.error(e); st.textContent = 'エンコードエラー：' + e.message; btn.disabled = false; }
+  });
+
+  (function configure(){
+    var tried = 0;
+    function next(){
+      tried++;
+      if (tried > 2){ st.textContent = 'ブラウザが H.264 エンコードに対応していません'; btn.disabled = false; return; }
+      var codec = tried === 1 ? 'avc1.4d002a' : 'avc1.42001f';
+      VideoEncoder.isConfigSupported({ codec: codec, width: w, height: h, bitrate: bitrate, framerate: b.fps, avc: { format: 'avc' } })
+        .then(function(info){
+          if (info.supported){
+            encoder.configure({ codec: codec, width: w, height: h, bitrate: bitrate, framerate: b.fps, avc: { format: 'avc' } });
+            start();
+          } else next();
+        }).catch(next);
+    }
+    next();
+  })();
+
+  var s = Math.min(w / (b.maxX - b.minX), h / (b.maxY - b.minY));
+  var tx = -b.minX * s + (w - (b.maxX - b.minX) * s) / 2;
+  var ty = -b.minY * s + (h - (b.maxY - b.minY) * s) / 2;
+
+  function drawFrame(t){
+    if (expGL) {
+      expGL.setTransform(s, tx, ty);
+      expGL.clear(0.2, 0.2, 0.2, 1);
+      skelList.forEach(function(sk){
+        if (sk.check && !sk.check.checked) return;
+        var an = findAnim(sk);
+        if (!an) return;
+        sk.state.setAnimation(0, an.name, false);
+        sk.state.update(t);
+        sk.state.apply(sk.skeleton);
+        applyPetitFlip(sk);
+        sk.skeleton.updateWorldTransform();
+        expGL.draw(sk.skeleton);
+      });
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.drawImage(expGLCanvas, 0, 0, w, h);
+      return;
+    }
+    ectx.setTransform(1,0,0,1,0,0);
+    ectx.fillStyle = '#333';
+    ectx.fillRect(0,0,expOff.width,expOff.height);
+    ectx.setTransform(s*EF,0,0,s*EF,tx*EF,ty*EF);
+    skelList.forEach(function(sk){
+      if (sk.check && !sk.check.checked) return;
+      var an = findAnim(sk);
+      if (!an) return;
+      sk.state.setAnimation(0, an.name, false);
+      sk.state.update(t);
+      sk.state.apply(sk.skeleton);
+      applyPetitFlip(sk);
+      sk.skeleton.updateWorldTransform();
+      expRenderer.draw(sk.skeleton);
+    });
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(expOff, 0, 0, expOff.width, expOff.height, 0, 0, w, h);
+  }
+
+  var total = Math.ceil(b.duration * b.fps);
+  var i = 0;
+  function step(){
+    if (i >= total){ finish(); return; }
+    drawFrame(i / b.fps);
+    var vf = new VideoFrame(canvas, { timestamp: Math.round(i * 1e6 / b.fps) });
+    encoder.encode(vf, { keyFrame: i % (b.fps * 2) === 0 });
+    vf.close();
+    i++;
+    if (i % 12 === 0 || i === total){
+      st.textContent = 'エンコード中' + i + '/' + total + 'フレーム';
+      setTimeout(step, 0);
+    } else {
+      step();
+    }
+  }
+  function start(){ st.textContent = '書き出し中（' + w + 'x' + h + '）...'; setTimeout(step, 30); }
+
+  async function finish(){
+    try {
+      await encoder.flush();
+      muxer.finalize();
+      var blob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
+      var name = 'CGSS_' + exportMp4Name() + '_' + w + 'x' + h + '_' + b.fps + 'fps.mp4';
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+      st.textContent = '書き出し完了' + name;
+      msg('書き出し完了：' + name + '（' + w + 'x' + h + '、' + b.fps + 'fps、最高ビットレート）');
+    } catch(e){
+      console.error(e);
+      st.textContent = '書き出し失敗：' + e.message;
+    }
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('btn_export').onclick = exportMP4;
+</script>
+</body>
+</html>
