@@ -13,12 +13,14 @@ Windows API（WinHTTP / GDI+ / conio / CreateProcess）を POSIX + libcurl + stb
 - RGB + A8 テクスチャ合成
 - Spine ブラウザプレビュー
 - USM / CG 展開（ffmpeg があれば MP4 化）
+  - macOS では音声合成は不可。
 - ACB 展開（acb2wavs または互換 CLI が PATH にあれば）
+  - macOS では不可。
 - unity3d 展開（隣に置いた AssetRipper.GUI.Free を headless で起動）
-  - カードイラスト / 背景 / 3Dフォトは画像だけ残す
+  - カードイラスト / 背景 / 3Dフォトは画像だけ出力
   - Spine は `.skel` `.atlas` `*_tex.png` `*_tex_A8.png` `SPC*.png` `SPSprachen_*` だけ残す
   - `.skel.bytes` は `.skel` に、`.atlas.bytes` / `.atlas.txt` は `.atlas` に改名する
-  - 3D モデルは glb（無償版は FBX を出さない）とテクスチャだけ残す
+  - 3D モデルは glbとテクスチャだけ出力
 
 移植していないもの:
 
@@ -30,7 +32,6 @@ Windows API（WinHTTP / GDI+ / conio / CreateProcess）を POSIX + libcurl + stb
 - CMake 3.16+
 - Xcode Command Line Tools（clang）
 - libcurl
-- 任意: ffmpeg、acb2wavs
 - 任意: [AssetRipper](https://github.com/AssetRipper/AssetRipper/releases) の macOS 版。`AssetRipper.GUI.Free` を実行ファイル隣の `AssetRipper/` に置く
 - 実行時に `master.mdb` と `manifest_*.db` を置く
 
@@ -52,7 +53,8 @@ cd build
 4. 次のメニューで種類を選ぶ。カードなら **`4.カード(名/キャラ名/id)`**。カード id か名前を入れて Enter。
 5. Space でリソースにチェックを付け、Enter でダウンロードする。
 
-保存先は `CGSS_Script` と同じ階層の `CGSS_DOWN` です。カードなら `CGSS_DOWN/<カードid><カード名>/カードイラスト` や `Spine` になります。画面にも保存パスが出ます。`Ā` のようなフォルダは失敗時のゴミなので消して構いません。
+保存先は `CGSS_Script` と同じ階層の `CGSS_DOWN` です。カードなら `CGSS_DOWN/<カードid><カード名>/カードイラスト` や `Spine` になります。
+画面にも保存パスが出ます。`Ā` のようなフォルダは失敗時のゴミなので消して構いません。
 
-アンパックはダウンロードではありません。ダウンロードが終わってから、メインメニューの **`2.アンパック`** → **`4.キャラリソース`** です。
+アンパックはダウンロードではありません。ダウンロードが終わってから、メインメニューの **`2.アンパック`** → **`4.キャラリソース`** をする。
 
