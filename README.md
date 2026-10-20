@@ -32,7 +32,8 @@ Windows API（WinHTTP / GDI+ / conio / CreateProcess）を POSIX + libcurl + stb
 - CMake 3.16+
 - Xcode Command Line Tools（clang）
 - libcurl
-- 任意: [AssetRipper](https://github.com/AssetRipper/AssetRipper/releases) の macOS 版。`AssetRipper.GUI.Free` を実行ファイル隣の `AssetRipper/` に置く
+- 任意: [AssetRipper](https://github.com/AssetRipper/AssetRipper/releases) の macOS 版。
+- `AssetRipper.GUI.Free` を実行ファイル隣の `AssetRipper/` に置く
 - 実行時に `master.mdb` と `manifest_*.db` を置く
 
 ```bash
@@ -54,7 +55,6 @@ cd build
 5. Space でリソースにチェックを付け、Enter でダウンロードする。
 
 保存先は `CGSS_Script` と同じ階層の `CGSS_DOWN` です。カードなら `CGSS_DOWN/<カードid><カード名>/カードイラスト` や `Spine` になります。
-画面にも保存パスが出ます。`Ā` のようなフォルダは失敗時のゴミなので消して構いません。
 
 アンパックはダウンロードではありません。ダウンロードが終わってから、メインメニューの **`2.アンパック`** → **`4.キャラリソース`** をする。
 
